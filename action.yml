@@ -178,7 +178,11 @@ runs:
         if [ "$i" -eq 0 ]; then
           aws ecs describe-task-definition \
             --task-definition "$TASK_DEF_ARN" \
-            --query 'taskDefinition' > temp-task-def.json
+            --query 'taskDefinition' > temp-task-def-full.json
+
+          # Remove fields that are not valid for register-task-definition
+          jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy, .deregisteredAt)' \
+            temp-task-def-full.json > temp-task-def.json
 
           # Update the container image
           jq --arg name "$CONTAINER_NAME" --arg image "$IMAGE_URI" \
@@ -227,7 +231,11 @@ runs:
         # Fetch and render migration task definition
         aws ecs describe-task-definition \
           --task-definition "$MIGRATION_TASK_DEF" \
-          --query 'taskDefinition' > migration-task-def.json
+          --query 'taskDefinition' > migration-task-def-full.json
+
+        # Remove fields that are not valid for register-task-definition
+        jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy, .deregisteredAt)' \
+          migration-task-def-full.json > migration-task-def.json
 
         # Update migration container image
         jq --arg name "${{ inputs.migration_container_name }}" --arg image "$MIGRATION_IMAGE_URI" \
