@@ -1,0 +1,388 @@
+name: 'Deploy ECS Service'
+description: 'Flexible ECS deployment supporting single container, multi-container, and migration patterns'
+author: 'Inner Circle DevOps'
+
+inputs:
+  # ============================================================
+  # Core Configuration
+  # ============================================================
+  environment:
+    description: 'Target environment (e.g., test1, test6, acceptance1)'
+    required: true
+  service:
+    description: 'Service name (e.g., backend, admin, sockets, imgresize)'
+    required: true
+  cluster_name:
+    description: 'ECS cluster name (defaults to theic-{environment})'
+    required: false
+    default: ''
+  service_name:
+    description: 'ECS service name (defaults to theic-{environment}-{service})'
+    required: false
+    default: ''
+
+  # ============================================================
+  # AWS Configuration
+  # ============================================================
+  aws_region:
+    description: 'AWS region'
+    required: true
+  aws_account_id:
+    description: 'AWS account ID'
+    required: true
+
+  # ============================================================
+  # Container Configuration
+  # ============================================================
+  containers:
+    description: |
+      JSON array of containers to deploy. Each container should have:
+      - name: Container name in task definition
+      - image: Image name (without tag/SHA)
+      - image_tag: Docker image tag/SHA
+
+      Example single container:
+      '[{"name": "ic-sockets", "image": "ic-sockets", "image_tag": "sha-abc123"}]'
+
+      Example multi-container (webserver + app):
+      '[
+        {"name": "ic-backend-webserver", "image": "ic-app-webserver", "image_tag": "sha-abc123"},
+        {"name": "ic-backend", "image": "ic-app", "image_tag": "sha-abc123"}
+      ]'
+    required: true
+
+  # ============================================================
+  # Migration/Pre-deployment Task Configuration
+  # ============================================================
+  run_migrations:
+    description: 'Whether to run migrations before deployment'
+    required: false
+    default: 'false'
+  migration_task_definition:
+    description: 'Task definition name for migrations (e.g., theic-test1-adminpanel-task)'
+    required: false
+    default: ''
+  migration_container_name:
+    description: 'Container name in migration task definition'
+    required: false
+    default: 'ic-task'
+  migration_command:
+    description: 'Command to run for migrations (e.g., "php artisan migrate --force")'
+    required: false
+    default: 'php artisan migrate --force'
+  migration_image:
+    description: 'Image to use for migrations (without tag)'
+    required: false
+    default: ''
+  migration_image_tag:
+    description: 'Image tag for migrations'
+    required: false
+    default: ''
+
+  # ============================================================
+  # Deployment Options
+  # ============================================================
+  manage_desired_count:
+    description: 'Whether to manage desired count (scale up if 0)'
+    required: false
+    default: 'false'
+  wait_for_stability:
+    description: 'Wait for service stability after deployment'
+    required: false
+    default: 'true'
+  propagate_tags:
+    description: 'Propagate tags (TASK_DEFINITION, SERVICE, or NONE)'
+    required: false
+    default: 'SERVICE'
+
+outputs:
+  task-definition-arn:
+    description: 'ARN of the deployed task definition'
+    value: ${{ steps.deploy.outputs.task-definition-arn }}
+  desired-count:
+    description: 'Desired count used for deployment (if managed)'
+    value: ${{ steps.get-desired-count.outputs.desired-count }}
+
+runs:
+  using: "composite"
+  steps:
+    # ============================================================
+    # Step 1: Set default names if not provided
+    # ============================================================
+    - name: "Set cluster and service names"
+      id: set-names
+      shell: bash
+      run: |
+        CLUSTER="${{ inputs.cluster_name }}"
+        if [ -z "$CLUSTER" ]; then
+          CLUSTER="theic-${{ inputs.environment }}"
+        fi
+        echo "cluster=$CLUSTER" >> "$GITHUB_OUTPUT"
+
+        SERVICE="${{ inputs.service_name }}"
+        if [ -z "$SERVICE" ]; then
+          SERVICE="theic-${{ inputs.environment }}-${{ inputs.service }}"
+        fi
+        echo "service=$SERVICE" >> "$GITHUB_OUTPUT"
+
+        echo "Using cluster: $CLUSTER"
+        echo "Using service: $SERVICE"
+
+    # ============================================================
+    # Step 2: Parse containers and render task definition
+    # ============================================================
+    - name: "Render container task definitions"
+      id: render-containers
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        # Parse containers JSON
+        CONTAINERS='${{ inputs.containers }}'
+        CONTAINER_COUNT=$(echo "$CONTAINERS" | jq '. | length')
+
+        echo "Rendering $CONTAINER_COUNT container(s)"
+
+        # Start with fetching the task definition ARN
+        TASK_DEF_ARN="arn:aws:ecs:${{ inputs.aws_region }}:${{ inputs.aws_account_id }}:task-definition/${{ steps.set-names.outputs.service }}"
+        TASK_DEF_FILE="task-definition-0.json"
+
+        # Render each container sequentially
+        for i in $(seq 0 $((CONTAINER_COUNT - 1))); do
+          CONTAINER=$(echo "$CONTAINERS" | jq -r ".[$i]")
+          CONTAINER_NAME=$(echo "$CONTAINER" | jq -r '.name')
+          IMAGE_NAME=$(echo "$CONTAINER" | jq -r '.image')
+          IMAGE_TAG=$(echo "$CONTAINER" | jq -r '.image_tag')
+          IMAGE_URI="${{ inputs.aws_account_id }}.dkr.ecr.${{ inputs.aws_region }}.amazonaws.com/${IMAGE_NAME}:${IMAGE_TAG}"
+
+          echo "Rendering container $((i+1))/$CONTAINER_COUNT: $CONTAINER_NAME with image $IMAGE_URI"
+
+          # Determine input type (ARN or file)
+          if [ $i -eq 0 ]; then
+            INPUT_TYPE="task-definition-arn"
+            INPUT_VALUE="$TASK_DEF_ARN"
+          else
+            INPUT_TYPE="task-definition"
+            INPUT_VALUE="task-definition-$((i-1)).json"
+          fi
+
+          OUTPUT_FILE="task-definition-$i.json"
+
+          # Use the render action
+          # Note: We need to create a temporary script since we can't call actions in a loop
+          cat > render-container-$i.sh <<EOF
+        #!/bin/bash
+        set -euo pipefail
+
+        # Fetch task definition if first iteration
+        if [ "$i" -eq 0 ]; then
+          aws ecs describe-task-definition \
+            --task-definition "$TASK_DEF_ARN" \
+            --query 'taskDefinition' > temp-task-def.json
+
+          # Update the container image
+          jq --arg name "$CONTAINER_NAME" --arg image "$IMAGE_URI" \
+            '.containerDefinitions = [.containerDefinitions[] | if .name == \$name then .image = \$image else . end]' \
+            temp-task-def.json > "$OUTPUT_FILE"
+        else
+          # Update the container image in existing file
+          jq --arg name "$CONTAINER_NAME" --arg image "$IMAGE_URI" \
+            '.containerDefinitions = [.containerDefinitions[] | if .name == \$name then .image = \$image else . end]' \
+            "$INPUT_VALUE" > "$OUTPUT_FILE"
+        fi
+        EOF
+
+          chmod +x render-container-$i.sh
+          ./render-container-$i.sh
+        done
+
+        # Save the final task definition file path
+        FINAL_TASK_DEF="task-definition-$((CONTAINER_COUNT - 1)).json"
+        echo "task-definition-file=$FINAL_TASK_DEF" >> "$GITHUB_OUTPUT"
+        echo "Final task definition: $FINAL_TASK_DEF"
+
+    # ============================================================
+    # Step 3: Run migrations (if enabled)
+    # ============================================================
+    - name: "Run pre-deployment migrations"
+      if: ${{ inputs.run_migrations == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        echo "Running migrations for service: ${{ inputs.service }}"
+
+        MIGRATION_TASK_DEF="${{ inputs.migration_task_definition }}"
+        if [ -z "$MIGRATION_TASK_DEF" ]; then
+          MIGRATION_TASK_DEF="${{ steps.set-names.outputs.service }}-task"
+        fi
+
+        MIGRATION_IMAGE="${{ inputs.migration_image }}"
+        MIGRATION_IMAGE_TAG="${{ inputs.migration_image_tag }}"
+        MIGRATION_IMAGE_URI="${{ inputs.aws_account_id }}.dkr.ecr.${{ inputs.aws_region }}.amazonaws.com/${MIGRATION_IMAGE}:${MIGRATION_IMAGE_TAG}"
+
+        echo "Migration task definition: $MIGRATION_TASK_DEF"
+        echo "Migration image: $MIGRATION_IMAGE_URI"
+
+        # Fetch and render migration task definition
+        aws ecs describe-task-definition \
+          --task-definition "$MIGRATION_TASK_DEF" \
+          --query 'taskDefinition' > migration-task-def.json
+
+        # Update migration container image
+        jq --arg name "${{ inputs.migration_container_name }}" --arg image "$MIGRATION_IMAGE_URI" \
+          '.containerDefinitions = [.containerDefinitions[] | if .name == $name then .image = $image else . end]' \
+          migration-task-def.json > migration-task-def-updated.json
+
+        # Register the migration task definition
+        MIGRATION_TASK_ARN=$(aws ecs register-task-definition \
+          --cli-input-json file://migration-task-def-updated.json \
+          --query 'taskDefinition.taskDefinitionArn' \
+          --output text)
+
+        echo "Registered migration task: $MIGRATION_TASK_ARN"
+
+        # Get network configuration from existing service
+        NETWORK_CONFIG=$(aws ecs describe-services \
+          --cluster "${{ steps.set-names.outputs.cluster }}" \
+          --services "${{ steps.set-names.outputs.service }}" \
+          --query 'services[0].networkConfiguration.awsvpcConfiguration' \
+          --output json)
+
+        echo "Network config: $NETWORK_CONFIG"
+
+        # Run migration task
+        TASK_ID="migrations-$(date +%s)-${{ github.run_id }}"
+        echo "Running migration task with ID: $TASK_ID"
+
+        aws ecs run-task \
+          --cluster "${{ steps.set-names.outputs.cluster }}" \
+          --task-definition "$MIGRATION_TASK_ARN" \
+          --enable-execute-command \
+          --propagate-tags TASK_DEFINITION \
+          --count 1 \
+          --network-configuration "{\"awsvpcConfiguration\": $NETWORK_CONFIG}" \
+          --overrides "{
+            \"containerOverrides\": [{
+              \"name\": \"${{ inputs.migration_container_name }}\",
+              \"command\": [\"${{ inputs.migration_command }}\"]
+            }]
+          }" \
+          --started-by "$TASK_ID"
+
+        # Wait for migration to complete
+        echo "Waiting for migration task to complete..."
+        TASK_ARN=$(aws ecs list-tasks \
+          --cluster "${{ steps.set-names.outputs.cluster }}" \
+          --started-by "$TASK_ID" \
+          --query 'taskArns[0]' \
+          --output text)
+
+        aws ecs wait tasks-stopped \
+          --cluster "${{ steps.set-names.outputs.cluster }}" \
+          --tasks "$TASK_ARN"
+
+        # Check exit code
+        EXIT_CODE=$(aws ecs describe-tasks \
+          --cluster "${{ steps.set-names.outputs.cluster }}" \
+          --tasks "$TASK_ARN" \
+          --query 'tasks[0].containers[0].exitCode' \
+          --output text)
+
+        if [ "$EXIT_CODE" != "0" ]; then
+          echo "❌ Migration failed with exit code: $EXIT_CODE"
+          exit 1
+        fi
+
+        echo "✅ Migrations completed successfully"
+
+    # ============================================================
+    # Step 4: Get current desired count (if enabled)
+    # ============================================================
+    - name: "Get current desired count"
+      if: ${{ inputs.manage_desired_count == 'true' }}
+      id: get-desired-count
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        # Get current desired count
+        CURRENT_COUNT=$(aws ecs describe-services \
+          --cluster "${{ steps.set-names.outputs.cluster }}" \
+          --services "${{ steps.set-names.outputs.service }}" \
+          --query 'services[0].desiredCount' \
+          --output text)
+
+        echo "Current desired count: $CURRENT_COUNT"
+
+        # If desired count is 0, set it to 1, otherwise keep current count
+        if [ "$CURRENT_COUNT" -eq 0 ]; then
+          DESIRED_COUNT=1
+          echo "⚠️  Service is scaled to 0 (likely out of office hours). Will scale to 1 during deployment."
+        else
+          DESIRED_COUNT=$CURRENT_COUNT
+          echo "Maintaining current desired count: $DESIRED_COUNT"
+        fi
+
+        echo "desired-count=$DESIRED_COUNT" >> "$GITHUB_OUTPUT"
+
+    # ============================================================
+    # Step 5: Register the new task definition
+    # ============================================================
+    - name: "Register new task definition"
+      id: register-task
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        TASK_DEF_FILE="${{ steps.render-containers.outputs.task-definition-file }}"
+
+        echo "Registering task definition from: $TASK_DEF_FILE"
+
+        # Register the task definition
+        TASK_DEF_ARN=$(aws ecs register-task-definition \
+          --cli-input-json file://$TASK_DEF_FILE \
+          --query 'taskDefinition.taskDefinitionArn' \
+          --output text)
+
+        echo "Registered task definition: $TASK_DEF_ARN"
+        echo "task-definition-arn=$TASK_DEF_ARN" >> "$GITHUB_OUTPUT"
+
+    # ============================================================
+    # Step 6: Deploy the service
+    # ============================================================
+    - name: "Deploy ECS service"
+      id: deploy
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        DEPLOY_CMD="aws ecs update-service \
+          --cluster ${{ steps.set-names.outputs.cluster }} \
+          --service ${{ steps.set-names.outputs.service }} \
+          --task-definition ${{ steps.register-task.outputs.task-definition-arn }} \
+          --force-new-deployment"
+
+        # Add desired count if managed
+        if [ "${{ inputs.manage_desired_count }}" == "true" ]; then
+          DEPLOY_CMD="$DEPLOY_CMD --desired-count ${{ steps.get-desired-count.outputs.desired-count }}"
+        fi
+
+        # Add propagate tags if specified
+        if [ "${{ inputs.propagate_tags }}" != "NONE" ]; then
+          DEPLOY_CMD="$DEPLOY_CMD --propagate-tags ${{ inputs.propagate_tags }}"
+        fi
+
+        echo "Deploying service..."
+        eval "$DEPLOY_CMD"
+
+        echo "task-definition-arn=${{ steps.register-task.outputs.task-definition-arn }}" >> "$GITHUB_OUTPUT"
+
+        # Wait for stability if requested
+        if [ "${{ inputs.wait_for_stability }}" == "true" ]; then
+          echo "Waiting for service stability..."
+          aws ecs wait services-stable \
+            --cluster "${{ steps.set-names.outputs.cluster }}" \
+            --services "${{ steps.set-names.outputs.service }}"
+          echo "✅ Service is stable"
+        fi
