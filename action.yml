@@ -279,7 +279,7 @@ runs:
           --output json)
 
         # Check for failures first
-        FAILURES=$(echo "$RUN_TASK_RESPONSE" | jq -r '.failures | length')
+        FAILURES=$(echo "$RUN_TASK_RESPONSE" | jq -r '.failures // [] | length')
         if [ "$FAILURES" -gt 0 ]; then
           echo "❌ Failed to start migration task:"
           echo "$RUN_TASK_RESPONSE" | jq '.failures'
