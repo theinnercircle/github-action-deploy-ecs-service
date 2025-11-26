@@ -310,14 +310,17 @@ runs:
 
         echo "Migration container exit code: $EXIT_CODE"
 
-        if [ -z "$EXIT_CODE" ] || [ "$EXIT_CODE" == "None" ] || [ "$EXIT_CODE" != "0" ]; then
-          echo "❌ Migration failed with exit code: $EXIT_CODE"
-          # Fetch logs if available
+        if [ -z "$EXIT_CODE" ] || [ "$EXIT_CODE" == "None" ]; then
+          echo "❌ Migration failed - container did not return an exit code"
+          # Fetch container reason for debugging
           aws ecs describe-tasks \
             --cluster "${{ steps.set-names.outputs.cluster }}" \
             --tasks "$TASK_ARN" \
             --query "tasks[0].containers[?name=='$CONTAINER_NAME'].reason" \
             --output text || true
+          exit 1
+        elif [ "$EXIT_CODE" != "0" ]; then
+          echo "❌ Migration failed with exit code: $EXIT_CODE"
           exit 1
         fi
 
