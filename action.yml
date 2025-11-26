@@ -259,11 +259,11 @@ runs:
 
         echo "Network config: $NETWORK_CONFIG"
 
-        # Run migration task
-        TASK_ID="migrations-$(date +%s)-${{ github.run_id }}"
-        echo "Running migration task with ID: $TASK_ID"
+        # Run migration task and capture the full response
+        echo "Running migration task..."
+        CONTAINER_NAME="${{ inputs.migration_container_name }}"
 
-        aws ecs run-task \
+        RUN_TASK_RESPONSE=$(aws ecs run-task \
           --cluster "${{ steps.set-names.outputs.cluster }}" \
           --task-definition "$MIGRATION_TASK_ARN" \
           --enable-execute-command \
@@ -272,33 +272,52 @@ runs:
           --network-configuration "{\"awsvpcConfiguration\": $NETWORK_CONFIG}" \
           --overrides "{
             \"containerOverrides\": [{
-              \"name\": \"${{ inputs.migration_container_name }}\",
+              \"name\": \"$CONTAINER_NAME\",
               \"command\": [\"${{ inputs.migration_command }}\"]
             }]
           }" \
-          --started-by "$TASK_ID"
+          --output json)
+
+        # Check for failures first
+        FAILURES=$(echo "$RUN_TASK_RESPONSE" | jq -r '.failures | length')
+        if [ "$FAILURES" -gt 0 ]; then
+          echo "❌ Failed to start migration task:"
+          echo "$RUN_TASK_RESPONSE" | jq '.failures'
+          exit 1
+        fi
+
+        TASK_ARN=$(echo "$RUN_TASK_RESPONSE" | jq -r '.tasks[0].taskArn')
+        echo "Migration task ARN: $TASK_ARN"
+
+        if [ -z "$TASK_ARN" ] || [ "$TASK_ARN" == "null" ] || [ "$TASK_ARN" == "None" ]; then
+          echo "❌ Failed to start migration task - no task ARN returned"
+          echo "$RUN_TASK_RESPONSE"
+          exit 1
+        fi
 
         # Wait for migration to complete
         echo "Waiting for migration task to complete..."
-        TASK_ARN=$(aws ecs list-tasks \
-          --cluster "${{ steps.set-names.outputs.cluster }}" \
-          --started-by "$TASK_ID" \
-          --query 'taskArns[0]' \
-          --output text)
-
         aws ecs wait tasks-stopped \
           --cluster "${{ steps.set-names.outputs.cluster }}" \
           --tasks "$TASK_ARN"
 
-        # Check exit code
+        # Check exit code for the specific migration container
         EXIT_CODE=$(aws ecs describe-tasks \
           --cluster "${{ steps.set-names.outputs.cluster }}" \
           --tasks "$TASK_ARN" \
-          --query 'tasks[0].containers[0].exitCode' \
+          --query "tasks[0].containers[?name=='$CONTAINER_NAME'].exitCode | [0]" \
           --output text)
 
-        if [ "$EXIT_CODE" != "0" ]; then
+        echo "Migration container exit code: $EXIT_CODE"
+
+        if [ -z "$EXIT_CODE" ] || [ "$EXIT_CODE" == "None" ] || [ "$EXIT_CODE" != "0" ]; then
           echo "❌ Migration failed with exit code: $EXIT_CODE"
+          # Fetch logs if available
+          aws ecs describe-tasks \
+            --cluster "${{ steps.set-names.outputs.cluster }}" \
+            --tasks "$TASK_ARN" \
+            --query "tasks[0].containers[?name=='$CONTAINER_NAME'].reason" \
+            --output text || true
           exit 1
         fi
 
