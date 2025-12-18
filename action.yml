@@ -59,7 +59,7 @@ inputs:
     required: false
     default: 'false'
   migration_task_definition:
-    description: 'Task definition name for migrations (e.g., theic-test1-adminpanel-task)'
+    description: 'Task definition name for migrations (e.g., theic-test1-adminpanel-migration)'
     required: false
     default: ''
   migration_container_name:
@@ -218,7 +218,7 @@ runs:
 
         MIGRATION_TASK_DEF="${{ inputs.migration_task_definition }}"
         if [ -z "$MIGRATION_TASK_DEF" ]; then
-          MIGRATION_TASK_DEF="${{ steps.set-names.outputs.service }}-task"
+          MIGRATION_TASK_DEF="${{ steps.set-names.outputs.service }}-migration"
         fi
 
         MIGRATION_IMAGE="${{ inputs.migration_image }}"
